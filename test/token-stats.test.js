@@ -121,7 +121,7 @@ test('token statistics UI keeps results under an overlay and exposes presets thr
   assert.match(source, /if \(!metadata\.cacheReady\)/);
   assert.doesNotMatch(source, /__wbsTokenStatsCacheReady/);
   assert.match(source, /setTimeout\(function \(\) \{ if \(!overlay\.hidden\)/);
-  assert.match(source, /formatTokenCount\(item\.calls/);
+  assert.match(source, /formatTokenCount\(row\.calls/);
   assert.match(source, /usageTimeSegmentHtml\('token'\)/);
   assert.match(source, /usageTimeSegmentHtml\('credit'\)/);
   assert.match(source, /data-' \+ kind \+ '-days="' \+ days/);
@@ -162,15 +162,28 @@ test('usage statistics modal uses a larger responsive dashboard layout in both t
   assert.match(source, /@media\(max-width:700px\)[\s\S]{0,220}\.wbs-usage-columns\{grid-template-columns:1fr\}/);
 });
 
-test('breakdown lines use distinct chart-only colors across light and dark themes', () => {
+test('usage charts derive all series from WorkBuddy theme tokens', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'inject.js'), 'utf8');
   const colors = source.match(/function usageTrendColors\(\) \{([\s\S]*?)\n    \}/);
   assert.ok(colors);
+  const palette = source.match(/\.wbs-trend-panel,\.wbs-usage-pie-section\{([^}]+)\}/)[1];
+  assert.doesNotMatch(palette, /#[0-9a-f]|rgba?\(/i);
+  assert.match(palette, /--wbs-chart-base:var\(--wbs-credit-theme-color,var\(--wbs-primary\)\)/);
+  assert.match(palette, /--wbs-trend-series-1:var\(--wbs-chart-base\)/);
+  assert.match(palette, /--wbs-trend-series-2:color-mix\(in srgb,var\(--wbs-chart-base\)/);
+  assert.match(palette, /--wbs-trend-series-12:color-mix\(in srgb,var\(--wbs-chart-base\)/);
+  assert.doesNotMatch(palette, /--wb-palette-(blue|purple|green|cyan|red|orange)-5/);
+  assert.match(source, /html\[data-theme="dark"\][\s\S]*--wbs-primary:#7f77dd/);
+  assert.match(source, /--wbs-credit-theme-color:var\(--wb-button-primary-bg\)/);
+  assert.equal((palette.match(/--wbs-trend-series-\d+:/g) || []).length, 12);
+  const chart = source.slice(source.indexOf('function renderUsageTrendChart'), source.indexOf('function usageTimeSegmentHtml'));
+  assert.doesNotMatch(chart, /--wbs-primary|34,197,94|#[0-9a-f]{3,8}/i);
   assert.doesNotMatch(colors[1], /--wbs-primary|--wb-color-text/);
-  assert.match(source, /\.wbs-trend-panel\{--wbs-trend-series-1:#/);
-  assert.match(source, /html\.cb-dark #wbs-token-stats-modal \.wbs-trend-panel/);
-  assert.match(source, /html\[data-theme="dark"\] #wbs-token-stats-modal \.wbs-trend-panel/);
-  assert.match(source, /body\[data-vscode-theme-name\*="dark" i\] #wbs-token-stats-modal \.wbs-trend-panel/);
+  assert.match(source, /getComputedStyle\(panel\)\.getPropertyValue\('--wbs-trend-series-1'\)/);
+  assert.match(source, /series = series\.map\(function \(line\)/);
+  assert.match(source, /resolveUsageColor\(line\.color, container\)/);
+  assert.doesNotMatch(source, /\.wbs-pie-legend\{[^}]*max-height/);
+  assert.doesNotMatch(source, /\.wbs-token-model-scroll\{[^}]*max-height/);
   assert.match(source, /state\.colorSlots\[mode\]/);
   assert.match(source, /slots\.delete\(key\)/);
   assert.match(source, /new Set\(groups\.map\(function \(group\) \{ return group\.key; \}\)\)/);

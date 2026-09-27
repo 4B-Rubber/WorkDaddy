@@ -5,16 +5,52 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../scripts/inject.js'), 'utf8');
+const daemon = fs.readFileSync(path.join(__dirname, '../scripts/daemon.js'), 'utf8');
 const section = (a,b) => source.slice(source.indexOf(a),source.indexOf(b,source.indexOf(a)));
+test('frosted glass takeover is visible above wallpaper controls and retains the saved setting', () => {
+  const theme = section('function buildThemePane()', 'function buildEnhancePane()');
+  const sessions = section('function buildSessionsPane()', 'function wireSessionsPane()');
+  assert.match(theme, /id="wbs-theme-takeover"/);
+  assert.match(theme, /<div class="wbs-pcard-title">毛玻璃主题<\/div>/);
+  assert.doesNotMatch(theme, /关闭后，加载和切换账号时保留 WorkBuddy 的主题/);
+  assert.match(source, /\.wbs-theme-takeover-row>\.wbs-pcard-title\{[^}]*flex:1/);
+  assert.ok(theme.indexOf('id="wbs-theme-takeover"') < theme.indexOf('wbs-wallpaper-card'));
+  assert.doesNotMatch(sessions, /wbs-theme-takeover|wbs-sess-theme-takeover/);
+  const wire = section('function wireThemePane()', '      var shadowSwitch =');
+  assert.match(wire, /themeSwitch.checked = sessState.themeTakeover/);
+  assert.match(wire, /if \(!themeSwitch\.dataset\.wbsWired\)/);
+  assert.match(wire, /setSessionSwitchWire\('themeTakeoverEnabled', this\)/);
+  assert.match(wire, /syncSessionModule\(\)/);
+  const apply = section('function applySessionModule(', 'function syncSessionModule()');
+  assert.match(apply, /themePane && themePane.querySelector\('#wbs-theme-takeover'\)/);
+  assert.doesNotMatch(theme, /id="wbs-theme-appearance-options"/);
+  assert.match(theme, /class="wbs-pcard wbs-avatar-card"/);
+  assert.ok(theme.indexOf('wbs-avatar-card') < theme.indexOf('wbs-fab-settings'));
+  assert.ok(theme.indexOf('wbs-fab-settings') < theme.indexOf('id="wbs-theme-takeover"'));
+  assert.match(theme, /class="wbs-pcard wbs-fab-settings"/);
+  assert.match(theme, /wbs-wallpaper-card wbs-theme-managed/);
+  assert.match(source, /function syncThemeTakeoverVisibility\(enabled\)/);
+
+});
 test('theme choices do not activate official data-theme scopes and robot radios reuse their visual component', () => {
   const pane = section('function buildThemePane()', 'function buildEnhancePane()');
   assert.doesNotMatch(pane, /data-theme="/);
-  assert.match(pane, /data-wbs-theme-option="dark"/);
+  assert.doesNotMatch(pane, /id="wbs-theme-seg"|data-wbs-theme-option=/);
+  assert.match(pane, /毛玻璃主题/);
   assert.match(pane, /class="wbs-theme-seg wbs-robot-seg"/);
   assert.match(pane, /class="wbs-theme-opt wbs-robot-option"/);
-  assert.match(source, /closest\('#wbs-theme-seg \.wbs-theme-opt'\)/);
+  assert.doesNotMatch(source, /closest\('#wbs-theme-seg \.wbs-theme-opt'\)/);
   assert.match(pane, /wbs-avatar-default-option/);
   assert.match(pane, /value="default"/);
+});
+
+test('theme pane exposes only the frosted glass takeover switch', () => {
+  const pane = section('function buildThemePane()', 'function buildEnhancePane()');
+  assert.match(pane, /<div class="wbs-pcard-title">毛玻璃主题<\/div>/);
+  assert.doesNotMatch(pane, /<div class="wbs-pcard-title">主题外观<\/div>/);
+  assert.doesNotMatch(pane, /data-wbs-theme-option=/);
+  assert.match(daemon, /if \(state\.themeTakeoverEnabled\) await applyThemeByCdp\('nebula'\)/);
+  assert.match(daemon, /let id = 'nebula';/);
 });
 test('account order is centered in the panel and always shows names without numbered rows', () => {
   const modal = section('function openAccountOrderModal()', 'function setupCreditSummary()');
@@ -55,4 +91,139 @@ test('avatar presets retain legacy custom uploads and are safe before official c
   assert.equal(choose('javascript:bad', 'official', 'brand').src, 'official');
   assert.match(source, /if \(!target\) \{\s*restoreAvatarDom\(\);\s*return;/);
   assert.doesNotMatch(source, /id="wbs-avatar-reset"/);
+});
+
+test('theme takeover off hides every managed theme module and blocks custom theme clicks', () => {
+  const visibility = section('function syncThemeTakeoverVisibility(', '    // 主题 pane 事件绑定');
+  assert.match(visibility, /querySelectorAll\('\.wbs-theme-managed'\)/);
+  assert.match(visibility, /node\.style\.display = visible \? '' : 'none'/);
+  assert.match(source, /var visible = sessState\.themeTakeover/);
+  assert.doesNotMatch(source, /if \(!sessState\.themeTakeover\) return;\s+var id = segBtn/);
+});
+
+
+test('theme takeover toggles only theme controls without changing the selected avatar', () => {
+  const managed = [{ style: {} }, { style: {} }];
+  let avatarChanges = 0;
+  const context = {
+    themePane: { querySelectorAll: selector => {
+      assert.equal(selector, '.wbs-theme-managed');
+      return managed;
+    } },
+    avatarLibrary: { snapshot: () => ({ selected: 'workdaddy' }), select: () => { avatarChanges++; } },
+    applyAvatar: () => { avatarChanges++; },
+  };
+  vm.runInNewContext(section('function syncThemeTakeoverVisibility(', '    // 主题 pane 事件绑定'), context);
+  context.syncThemeTakeoverVisibility(false);
+  assert.ok(managed.every(node => node.style.display === 'none'));
+  context.syncThemeTakeoverVisibility(true);
+  assert.ok(managed.every(node => node.style.display === ''));
+  assert.equal(avatarChanges, 0);
+  assert.match(source, /\.wbs-theme-takeover-row:has\(#wbs-theme-takeover:not\(:checked\)\)\{margin-bottom:0;padding-bottom:0;border-bottom:0\}/);
+});
+
+
+test('glass panel controls keep opaque primary colors without changing composer buttons', () => {
+  const rule = source.split('\n').find(line => line.includes('html[data-wbs-theme-id="nebula"] .wbs-panel,'));
+  assert.ok(rule, 'glass overrides are scoped to WorkDaddy panel and modal surfaces');
+  assert.match(rule, /html\[data-wbs-theme-id="nebula"\] \.wbs-modal/);
+  assert.match(rule, /--wb-button-primary-bg:var\(--wb-palette-white-90\)/);
+  assert.match(rule, /--wb-button-primary-fg:var\(--wb-bg-primary\)/);
+  assert.doesNotMatch(rule, /\.wbs-root|\.wbs-stash-inline|\.wbs-fab/);
+});
+
+test('theme refresh preserves robot radio selection while keeping the glass wallpaper visible', async () => {
+  const robot = { active: true, getAttribute: () => null };
+  robot.classList = { toggle: (_, selected) => { robot.active = selected; } };
+  const group = buttons => ({ querySelectorAll: () => buttons, querySelector: () => buttons.find(b => b.active) });
+  let synced = null;
+  const root = { querySelector: () => group([robot]) };
+  const context = { root, api: () => Promise.resolve({current:'cyber-purple'}), syncWallpaperCardVisibility: theme => { synced = theme; } };
+  vm.runInNewContext(section('    function loadThemes()', '    // 页面主题由 daemon'), context);
+  context.loadThemes();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(robot.active, true, 'appearance refresh must not clear the robot highlight');
+  assert.equal(synced, 'nebula');
+  assert.equal(context.themeSelectValue(), 'nebula');
+});
+
+test('all panel switches share themed track, thumb and keyboard focus colors', () => {
+  const css = section("    '.wbs-switch{", "    /* 背景毛玻璃开关");
+  assert.match(css, /background:var\(--wb-bg-tertiary/);
+  assert.match(css, /input:checked \+ \.wbs-switch-slider\{background:var\(--wb-button-primary-bg/);
+  assert.match(css, /input:checked \+ \.wbs-switch-slider:before\{background:var\(--wb-button-primary-fg/);
+  assert.match(css, /input:focus-visible \+ \.wbs-switch-slider/);
+  assert.doesNotMatch(css, /background:#(?:f2f2f4|111113)/);
+});
+
+test('custom themes color account and expiry bars with primary token while preserving expiry opacity', () => {
+  const rule = source.split('\n').find(line => line.includes('--wbs-credit-theme-color:var(--wb-button-primary-bg)'));
+  assert.ok(rule, 'custom skins and nonstandard WorkDaddy themes opt into the theme token');
+  for (const id of ['default','dark','nebula']) assert.ok(rule.includes(':not([data-wbs-theme-id="'+id+'"])'));
+  assert.ok(rule.includes('[data-skin]'));
+  assert.ok(rule.includes('.wbs-credit-summary-popover'));
+  assert.match(source, /color-mix\(in srgb,var\(--wbs-credit-theme-color/);
+  assert.match(source, /calc\(var\(--wbs-credit-alpha,1\) \* 100%\)/);
+});
+
+for (const trigger of ['switch', 'settings refresh']) test('frosted wallpaper starts loading on ' + trigger + ' without revisiting the tab', async () => {
+  const grid = { dataset: {}, innerHTML: '壁纸加载中…', querySelectorAll: () => [] };
+  const card = { style: {} }, toggle = { checked: false };
+  const nodes = { '#wbs-wallpapers': grid, '#wbs-wallpaper-card': card, '#wbs-theme-takeover': toggle };
+  const requests = [];
+  let resolveWallpapers;
+  const context = {
+    sessState: {}, enhancePane: null, conversationUsageEnabled: false,
+    themePane: { querySelector: selector => nodes[selector] || null, querySelectorAll: () => [card] },
+    root: { querySelector: selector => nodes[selector] || null },
+    API: 'http://127.0.0.1:47833',
+    api: (route, opts) => {
+      requests.push(route);
+      if (route === '/api/wallpapers') return new Promise(resolve => { resolveWallpapers = resolve; });
+      return Promise.resolve({ ok: true, themeTakeoverEnabled: route === '/api/session-module-set' ? JSON.parse(opts.body).enabled : true });
+    },
+    renderQpList() {}, renderExploreOptions() {}, syncStash() {}, lockPanelHeight() {},
+    setTimeout() {}, escAttr: value => value, esc: value => value,
+    toast: message => assert.fail(message),
+  };
+  vm.runInNewContext(section('function applySessionModule(', '    /** 增强页快捷短语列表') +
+    section('function syncWallpaperCardVisibility(', '    // 主题 pane 事件绑定') +
+    section('function loadWallpapers(force)', '    function setOpen('), context);
+  context.applySessionModule({ ok: true, themeTakeoverEnabled: false });
+  context.syncWallpaperCardVisibility('nebula'); // First visit with takeover off.
+  assert.equal(requests.length, 0);
+  if (trigger === 'switch') {
+    toggle.checked = true;
+    await context.setSessionSwitchWire('themeTakeoverEnabled', toggle);
+  } else {
+    context.syncSessionModule();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(card.style.display, '');
+  assert.equal(requests.filter(route => route === '/api/wallpapers').length, 1);
+  context.applySessionModule({ ok: true, themeTakeoverEnabled: true });
+  assert.equal(requests.filter(route => route === '/api/wallpapers').length, 1, 'pending loads are reused');
+  resolveWallpapers({ wallpapers: [{ name: 'wallpaper-01.webp', title: '官方壁纸 1' }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(grid.innerHTML, /data-wp="wallpaper-01.webp"/);
+  assert.doesNotMatch(grid.innerHTML, /壁纸加载中/);
+  context.applySessionModule({ ok: true, themeTakeoverEnabled: false });
+  context.applySessionModule({ ok: true, themeTakeoverEnabled: true });
+  assert.equal(requests.filter(route => route === '/api/wallpapers').length, 1, 'loaded wallpaper grid is reused');
+});
+
+test('primary actions use native button tokens in every interaction state', () => {
+  for (const selector of ['.wbs-modal-btn.wbs-modal-ok', '.wbs-sess-bbtn.active', '.wbs-acc-switch.armed', '.wbs-sess-done']) {
+    const start = source.indexOf(selector + '{');
+    const rule = source.slice(start, source.indexOf('}', start));
+    assert.match(rule, /background:var\(--wb-button-primary-bg/);
+    assert.match(rule, /color:var\(--wb-button-primary-fg/);
+  }
+  assert.doesNotMatch(source, /--wb-button-primary-(hover-bg|text)\b/);
+  assert.match(source, /background:var\(--wb-button-primary-bg-disabled/);
+  assert.match(source, /color:var\(--wb-button-primary-fg-disabled/);
+  assert.match(source, /\.wbs-modal-btn:not\(:where\(\.wbs-modal-ok,\.primary\)\)/);
+  const glass = source.split('\n').find(line => line.includes('html[data-wbs-theme-id="nebula"] .wbs-panel,'));
+  assert.match(glass, /\.wbs-account-note-popover/);
+  assert.match(glass, /\.wbs-status-popover/);
 });

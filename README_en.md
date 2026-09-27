@@ -37,6 +37,7 @@ It injects UI components into the running WorkBuddy renderer without patching or
 - **Daily credits:** daily check-in automation is disabled by default. On the first panel opening, a risk notice lets you enable the task or cancel. Either choice is saved locally and dismisses future notices; you can later enable or disable the task under Automations.
 - **Token and credit usage pages:** review daily token and credit consumption, filter by account, and view usage rankings by model and account.
 - **Credit-aware account suggestions:** when an account is running low on credits, WorkDaddy suggests another account you can use.
+- **Model rate limits and reset estimates:** when a model rate limit is detected, the Accounts page shows the affected model and its estimated reset time. If no reset time is provided, it displays “Time unknown.”
 - **Automation tasks:** discover and import tasks from public GitHub and Gitee repositories, or describe what you need and let WorkBuddy create a task. Supports manual, event, and scheduled triggers, run logs, stopping tasks, and JSON / ZIP export.
 - **Quiet approval mode:** automatically handle supported permission prompts while you are away.
 - **Stash prompts:** send drafts to WorkBuddy's pending message queue while preserving images, files, and quotes for later use.
@@ -156,7 +157,7 @@ Click the robot button in the lower-right corner of WorkBuddy and choose a tab:
 
 | Tab            | Purpose                                                                                                                                   |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| **Accounts**   | View account counts, credits, check-ins, and login status; switch, delete, or add accounts; import/export encrypted backups               |
+| **Accounts**   | View account counts, credits, model rate limits and estimated reset times, check-ins, and login status; switch, delete, or add accounts; import/export encrypted backups               |
 | **Theme**      | Switch between the default and WorkDaddy themes, choose or upload wallpapers, change avatars, and adjust blur and background overlays     |
 | **Sessions**   | Filter by account and date, copy or delete in bulk, and configure automatic session or workspace copying when switching accounts          |
 | **Models**     | Manage current and alternative models, including backups, copying, editing, enabling, connectivity tests, and bulk deletion               |

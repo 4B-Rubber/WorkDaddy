@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const childProcess = require('node:child_process');
 const fs = require('node:fs');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -427,6 +428,23 @@ test('Windows launcher keeps local port probing and profile CDP candidates defin
   assert.match(launcher, /'workbuddy-cn': \[9222/);
   assert.match(launcher, /'workbuddy-ai': \[9223/);
   assert.match(launcher, /isTargetForProfile\(target, PROFILE\)/);
+});
+
+test('Windows launcher has an OS-assigned CDP fallback when profile ports are unavailable', async () => {
+  const launcherSource = read('win-launcher.js');
+  assert.match(launcherSource, /function reserveEphemeralCdpPort\(\)/);
+  assert.match(launcherSource, /server\.listen\(\{ host: HOST, port: 0 \}/);
+  assert.match(launcherSource, /const ephemeralPort = await reserveEphemeralCdpPort\(\)/);
+  assert.match(launcherSource, /CDP_PORT_DYNAMIC/);
+
+  const launcher = require(path.join(repoRoot, 'scripts', 'win-launcher.js'));
+  const port = await launcher.reserveEphemeralCdpPort();
+  assert.ok(Number.isInteger(port) && port >= 1024 && port <= 65535);
+  await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen({ host: '127.0.0.1', port }, () => server.close((error) => error ? reject(error) : resolve()));
+  });
 });
 
 test('Windows launcher propagates the WorkBuddy AI UI port to child processes', { skip: process.platform !== 'win32' }, () => {
@@ -958,7 +976,7 @@ test('account cards keep the compact three-row layout', () => {
   assert.doesNotMatch(script, /data-tip="' \+ attrTip \+ '" title=/);
   assert.match(script, /creditOpacity\(row\.days\)/);
   assert.match(script, /creditOpacity\(segment\.expiresAt/);
-  assert.match(script, /\.wbs-credit-segment,\.wbs-credit-summary-fill\{background:rgba\(var\(--wbs-primary-rgb,34,197,94\),var\(--wbs-credit-alpha,1\)\)/);
+  assert.match(script, /\.wbs-credit-segment,\.wbs-credit-summary-fill\{background:color-mix\(in srgb,var\(--wbs-credit-theme-color,var\(--wbs-primary\)\) calc\(var\(--wbs-credit-alpha,1\) \* 100%\),transparent\)/);
   ['dark', 'cyber-purple', 'nebula'].forEach((themeId) => {
     assert.match(script, new RegExp('html\\[data-wbs-theme-id="' + themeId + '"\\][\\s\\S]*--wbs-primary-rgb:127,119,221'));
   });
@@ -966,6 +984,22 @@ test('account cards keep the compact three-row layout', () => {
   assert.match(script, /今日签到/);
   assert.match(script, /function accountStatusTagsHtml\(a\)/);
   assert.match(script, /function checkinBadgeHtml\(a\)/);
+  assert.match(script, /wbs-model-rate-limit wbs-ck wbs-checkin-tag ok/);
+  assert.match(script, /function setupModelRateLimitPopover\(\)/);
+  assert.match(script, /\.wbs-status-popover\.is-rate-limit/);
+  assert.match(script, /\.wbs-status-popover\.is-rate-limit\{width:500px/);
+  assert.match(script, /\.wbs-status-popover\.is-rate-limit-summary\{width:360px/);
+  assert.match(script, /data-act="model-rate-limit-summary"/);
+  assert.match(script, /function modelRateLimitSummaryPopoverHtml\(accounts\)/);
+  assert.match(script, /showStatusPopover\(summaryButton, modelRateLimitSummaryPopoverHtml\(state\.accounts\)/);
+  assert.match(script, /placement === 'below'/);
+  assert.match(script, /\.wbs-model-rate-limit-summary-row/);
+  assert.match(script, /\.wbs-model-rate-limit-detail b\{white-space:nowrap/);
+  assert.match(script, /wbs-model-rate-limit-model/);
+  assert.match(script, /wbs-model-rate-limit-reset/);
+  assert.doesNotMatch(script, /限流期间可切换其他模型/);
+  assert.match(script, /function fmtDateTimeSeconds\(ts\)/);
+  assert.doesNotMatch(script, /wbs-model-rate-limit[^']*cursor:help/);
   assert.match(script, /badge \+ dailyRingsHtml\(a\) \+ checkinBadge/);
   assert.match(script, /if \(!usage \|\| usage\.synced !== true\) return '';/);
   assert.match(script, /wbs-usage-tag/);
@@ -995,7 +1029,8 @@ test('account cards sort by credit expiry without pinning the current account', 
 test('quick-phrase layering does not reposition WorkBuddy native chat toolbar', () => {
   const script = read('inject.js');
   assert.match(script, /\.wbs-explore-inline\.wbs-stash-inline-inline\{position:relative;z-index:99999\}/);
-  assert.match(script, /\.wbs-explore-pop\{[^}]*z-index:2147483647/);
+  assert.match(script, /\.wbs-explore-pop\{position:fixed;[^}]*z-index:22/);
+  assert.match(script, /document\.body\.appendChild\(popup\)/);
   assert.match(script, /html\[data-wbs-theme-id="nebula"\] \.wbs-explore-card\{[^}]*background:color-mix\(in srgb,var\(--wb-bg-popover/);
   assert.match(script, /html\[data-wbs-theme-id="nebula"\] \.wbs-explore-tip\{[^}]*background:color-mix\(in srgb,var\(--wb-bg-popover/);
   assert.doesNotMatch(script, /_chatMessageBottomToolbarWrapper_\}\{position:relative;z-index:68/);
