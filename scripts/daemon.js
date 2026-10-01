@@ -432,9 +432,9 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.188：关闭主题接管时跟随 WorkBuddy AI 的原生 agent-ui-theme，避免旧快照覆盖官方浅色/深色选择。
 // 1.2.189：毛玻璃底色等待移至 daemon，避免后台页面定时器节流拖延开关和壁纸加载。
 // 1.2.191：CodeDaddy 共用完整面板，通过本机 CDP 适配通信、原生登录态和会话缓存。
-// 1.2.10：合并会话、用量、启动器及 CodeBuddy IDE 注入重试与积分刷新修复。
-const DAEMON_VERSION = '1.2.10';
-const DAEMON_BUILD_ID = 'release-1.2.10-20260930-markdown-preview';
+// 1.2.11：账号切换刷新只依赖页面重载与同步完成后的列表刷新，避免官方列表重复合并。
+const DAEMON_VERSION = '1.2.11';
+const DAEMON_BUILD_ID = 'release-1.2.11-20261001-account-reload-list';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -2511,21 +2511,9 @@ async function reloadWorkBuddyPage(options = {}) {
   const pending = armPendingReloadInjection(frameId);
   try {
     await withTimeout(cdpSend('Page.reload', { ignoreCache: false }), 10000, '刷新 WorkBuddy 页面');
-    // WorkBuddy's SQLite replacement and renderer reload do not publish the
-    // local collection change. Refresh after WorkDaddy has mounted so the
-    // official controller sees migrated/history rows before user interaction.
-    const refreshAfterMount = pending.ready.then((mounted) => {
-      if (!mounted) return false;
-      const uid = String((currentAccount() || {}).uid || '').trim();
-      return refreshWorkBuddySessionList(uid, 'account-reload');
-    }).catch(() => false);
-    if (options.waitForInjection === false) {
-      refreshAfterMount.catch(() => {});
-      return true;
-    }
+    if (options.waitForInjection === false) return true;
     const mounted = await pending.ready;
     if (!mounted) log('[cdp] 页面重载后组件未在 5 秒内确认挂载，继续后台流程');
-    if (mounted) await refreshAfterMount;
     return mounted;
   } catch (error) {
     settlePendingReloadInjection(pending, false);
