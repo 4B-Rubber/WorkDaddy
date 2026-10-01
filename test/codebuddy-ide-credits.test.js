@@ -101,3 +101,13 @@ test('IDE shares the WorkDaddy panel without restricting tab navigation', () => 
     assert.equal(tabs.find(tab => tab.classList.active).getAttribute(), name);
   }
 });
+
+test('workbench 完整面板路径注入原生账号菜单去重样式（多个头像行回归）', () => {
+  // 1.2.10 consolidate 曾把去重样式留在不再调用的 injectCodeBuddyIdeMode 里：
+  // workbench 跑完整面板 → 样式从未注入 → genie 菜单按认证会话累积的旧账号行
+  // 全部显示成当前账号（多个一模一样的头像行）。去重样式必须挂在完整面板注入路径。
+  const panelPath = source.slice(source.indexOf('\n  // User-facing strings', source.indexOf('  function injectCodeBuddyIdeMode()')));
+  assert.ok(panelPath.includes('wbs-ide-menu-dedupe-style'), '去重样式必须挂在完整面板注入路径');
+  assert.ok(panelPath.includes('li.genie-account-menu-item ~ li.genie-account-menu-item'), '去重规则选择器必须在面板路径中');
+  assert.ok(/workbench\\?\.html/.test(panelPath), '面板路径必须包含 workbench 页面判定');
+});

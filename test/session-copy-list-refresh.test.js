@@ -79,6 +79,30 @@ test('explicit migration wires the same official list refresh seam', () => {
   assert.match(route, /await refreshWorkBuddySessionList\(String\(\(currentAccount\(\) \|\| \{\}\)\.uid \|\| ''\)\.trim\(\), 'sessions-migrate'\)/);
 });
 
+test('account reload does not refresh the official list a second time', async () => {
+  const start = source.indexOf('async function reloadWorkBuddyPage(');
+  const end = source.indexOf('const WORKBUDDY_TARGET', start);
+  assert.ok(start >= 0 && end > start);
+  let refreshes = 0;
+  const calls = [];
+  const ctx = {
+    cdp: { connected: true },
+    cdpSend: async (method) => { calls.push(method); },
+    armPendingReloadInjection: () => ({ ready: Promise.resolve(true) }),
+    settlePendingReloadInjection: () => {},
+    currentAccount: () => ({ uid: 'target' }),
+    refreshWorkBuddySessionList: async () => { refreshes++; return true; },
+    log: () => {},
+    setTimeout,
+    clearTimeout,
+  };
+  vm.runInNewContext(source.slice(start, end), ctx);
+  assert.equal(await ctx.reloadWorkBuddyPage({ waitForInjection: false }), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, ['Page.getFrameTree', 'Page.reload']);
+  assert.equal(refreshes, 0);
+});
+
 test('an unavailable renderer never turns a committed session copy into failure', async () => {
   const h = harness({ reject: true });
   const job = await h.run();

@@ -152,6 +152,25 @@ test('an activation-only session-meta append does not become an imported continu
   f.write('b', [...base, { ...stable, id: 'event-b', sessionId: 'b', timestamp: 200 }]);
   assert.equal(compareSnapshots(f.read('b'), f.read('a')).kind, 'equal');
 });
+
+test('different session-meta counts do not shift the real transcript sequence', t => {
+  const f = fixture(t);
+  const stable = { type: 'session-meta', meta: { 'codebuddy.ai/hostKind': 'unopted' } };
+  const continuation = [message('user', 'continued'), message('assistant', 'reply')];
+  f.write('a', [
+    ...base,
+    { ...stable, id: 'a-1', sessionId: 'a', timestamp: 100 },
+    { ...stable, id: 'a-2', sessionId: 'a', timestamp: 101 },
+    ...continuation,
+  ]);
+  f.write('b', [
+    ...base,
+    { ...stable, id: 'b-1', sessionId: 'b', timestamp: 200 },
+    ...continuation,
+  ]);
+  assert.equal(compareSnapshots(f.read('a'), f.read('b')).kind, 'equal');
+});
+
 test('missing payload is repairable and symlinked files are skipped without following them', async t => {
   const f = fixture(t); f.write('a', base);
   assert.equal(compareSnapshots(f.read('a'), f.read('b')).kind, 'left-extends');
