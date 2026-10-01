@@ -1932,6 +1932,9 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '不是 WorkDaddy 的账号导出文件': 'Not a WorkDaddy account export file', '导入文件中没有账号数据': 'No account data found in the import file',
     '未读取到有效内容，请选择导出文件': 'No valid content read; please choose an export file', '密码不能超过 1024 个字符': 'Password cannot exceed 1024 characters',
     '当前登录文件无法唯一确认，已拒绝退出登录': 'The current login file cannot be uniquely identified; logout rejected',
+    '原生登录态已切换，无需重启客户端': 'Native login session switched; no restart needed',
+    '登录文件已切换，请刷新窗口使新账号生效': 'Login file switched; refresh the window to apply the new account',
+    '已切换并触发窗口刷新': 'Switched and the window refresh was triggered',
     '不能删除当前登录的账号（请先退出登录或切换到其他账号）': 'Cannot delete the currently logged-in account (log out or switch to another account first)',
     '删除登录文件后仍然存在': 'The login file still exists after deletion',
     '诊断设置由 WORKDADDY_TELEMETRY 环境变量控制': 'Diagnostics are controlled by the WORKDADDY_TELEMETRY environment variable',
@@ -16052,10 +16055,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           })
             .then(function (r) {
               var autoCopy = r && r.autoCopy;
+              // 兜底文案优先用 daemon 返回的 hint：codebuddy 走原生会话替换，切换即时生效
+              // （无需重启/刷新），"重启后生效"只适用于 WorkBuddy 文件替换且 CDP 刷新失败的场景。
               toast(
                 r.reloaded
                   ? (autoCopy && autoCopy.jobId ? '已切换为「' + (r.nickname || r.uid) + '」，正在同步已标记会话…' : '已切换为「' + (r.nickname || r.uid) + '」，开始领取积分…')
-                  : '已切换为「' + (r.nickname || r.uid) + '」，重启后生效',
+                  : (r.hint || '已切换为「' + (r.nickname || r.uid) + '」，重启后生效'),
                 false,
                 root
               );
