@@ -1935,6 +1935,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '原生登录态已切换，无需重启客户端': 'Native login session switched; no restart needed',
     '登录文件已切换，请刷新窗口使新账号生效': 'Login file switched; refresh the window to apply the new account',
     '已切换并触发窗口刷新': 'Switched and the window refresh was triggered',
+    '跨工作区会话请在对应项目窗口的历史中查看': 'Cross-workspace sessions appear in the history of that project window',
     '不能删除当前登录的账号（请先退出登录或切换到其他账号）': 'Cannot delete the currently logged-in account (log out or switch to another account first)',
     '删除登录文件后仍然存在': 'The login file still exists after deletion',
     '诊断设置由 WORKDADDY_TELEMETRY 环境变量控制': 'Diagnostics are controlled by the WORKDADDY_TELEMETRY environment variable',
@@ -9697,7 +9698,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ ids: ids, targetUid: sel.value }),
           }).then(function (result) {
-            toast(sessionCopySummaryText(result), false, root);
+            // [CodeBuddy 会话同步] 主窗口历史记录按工作区隔离：cwd 与当前窗口工作区不同的
+            // 会话不会出现在本窗口历史里（CodeBuddy 设计，非同步失败）。同工作区会话已由
+            // daemon 的 reloadIdeWorkbenchWindows 让侧边栏立即可见；跨工作区只作提示。
+            var currentWorkspaceName = '';
+            var titleMatch = /^([^–]+?)\s+-\s+CodeBuddy/.exec(String(document.title || ''));
+            if (titleMatch) currentWorkspaceName = titleMatch[1].trim();
+            var crossWorkspace = currentWorkspaceName && sessionsState.list.some(function (s) {
+              if (ids.indexOf(s.id) === -1 || !s.cwd) return false;
+              var folder = String(s.cwd).replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+              return folder !== currentWorkspaceName;
+            });
+            toast(sessionCopySummaryText(result) +
+              (crossWorkspace && (Number(result && result.copied) || 0) > 0
+                ? ' · 跨工作区会话请在对应项目窗口的历史中查看' : ''), false, root);
             showSessModal(false);
             loadSessions();
           }).catch(function (e) {
