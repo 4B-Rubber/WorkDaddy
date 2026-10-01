@@ -435,8 +435,11 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.10：合并会话、用量、启动器及 CodeBuddy IDE 注入重试与积分刷新修复。
 // 1.2.11：IDE workbench 共用完整面板后修正浮层确认探针（认 .wbs-root）；
 //         原生账号菜单去重样式移入完整面板注入路径，修复"多个头像"回归。
-const DAEMON_VERSION = '1.2.11';
-const DAEMON_BUILD_ID = 'release-1.2.11-20261001-ide-panel-probe';
+// 1.2.12：手动同步（copy/migrate）当前账号后 Page.reload IDE workbench——
+//         扩展宿主 indexCache（TTL 5min）不因外部写 index.json 失效，侧边栏
+//         此前要等缓存过期或重启才显示同步的会话。
+const DAEMON_VERSION = '1.2.12';
+const DAEMON_BUILD_ID = 'release-1.2.12-20261001-ide-sync-reload';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -2467,6 +2470,27 @@ async function ideSyncScan() {
   for (const [id, entry] of idePages) {
     if (!alive.has(id) && (!entry.ws || entry.ws.readyState !== 1)) idePages.delete(id);
   }
+}
+
+// [CodeBuddy 会话同步] 手动同步（copy/migrate）后刷新 IDE workbench 窗口。
+// 根因：genie 扩展宿主的会话列表 indexCache（LRU，TTL 5 分钟）不会因外部写入
+// history index.json 而失效（无文件监听），v2 广播对新会话只做 rename/delete——
+// applyUpsert 对缓存外会话直接跳过（"upsert skip, not in this EH"）。侧边栏因此
+// 只能等缓存过期或重启。手动同步是显式用户动作，直接 Page.reload（与账号切换
+// 同级别）。自动复制（切号触发）不刷新：账号切换的 session-change 事件本身
+// 会触发 clearHistoryIndexCache。reload 后 loadEventFired 处理器会自动补注入。
+function reloadIdeWorkbenchWindows(reason) {
+  if (PROFILE.kind !== 'codebuddy') return false;
+  let scheduled = 0;
+  for (const entry of idePages.values()) {
+    if (!entry.ws || entry.ws.readyState !== 1) continue;
+    scheduled++;
+    ideSend(entry, 'Page.reload', { ignoreCache: false })
+      .then(() => log(`[sessions-sync] 已刷新 IDE 窗口(${reason}) target=${String(entry.url || '').slice(-48)}`))
+      .catch((e) => log(`[sessions-sync] IDE 窗口刷新失败(${reason}): ${e.message}`));
+  }
+  if (!scheduled) log(`[sessions-sync] 无已连接的 IDE 窗口可刷新(${reason})`);
+  return scheduled > 0;
 }
 
 async function cdpLoop() {
@@ -10820,6 +10844,13 @@ function handleApi(req, res) {
           else if (result.status === 'skipped') skipped++;
           else copied++;
         }
+        // [CodeBuddy 会话同步] 同步到当前账号时刷新 IDE workbench：扩展宿主的
+        // indexCache 不因外部写 index.json 失效，侧边栏要等 TTL/重启才显示（详见
+        // reloadIdeWorkbenchWindows 注释）。同步到其他账号无需刷新——切号时
+        // session-change 会清缓存。
+        if (copied > 0 && targetUid === String((currentAccount() || {}).uid || '')) {
+          reloadIdeWorkbenchWindows('sessions-copy');
+        }
         return json(res, 200, { ok: true, copied, skipped, conflicts, targetUid, warning });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
@@ -10859,6 +10890,14 @@ function handleApi(req, res) {
         // WorkBuddy's collection store. Refresh the visible account's list so
         // a migrated history row is hydrated by the official controller.
         await refreshWorkBuddySessionList(String((currentAccount() || {}).uid || '').trim(), 'sessions-migrate');
+        // [CodeBuddy 会话同步] 迁入或迁出当前账号都刷新 IDE workbench：扩展宿主的
+        // indexCache 不因外部写 index.json 失效（详见 reloadIdeWorkbenchWindows 注释），
+        // 迁入需让新会话出现，迁出需让旧条目消失。
+        const migrateCurrentUid = String((currentAccount() || {}).uid || '');
+        if (before.length && (targetUid === migrateCurrentUid
+            || before.some((row) => String(row.user_id || '') === migrateCurrentUid))) {
+          reloadIdeWorkbenchWindows('sessions-migrate');
+        }
         return json(res, 200, { ok: true, moved: before.length, requested: ids.length, targetUid, rulesMoved });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
