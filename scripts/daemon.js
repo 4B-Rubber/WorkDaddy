@@ -163,7 +163,7 @@ const { readWorkBuddyTarget } = require('./workbuddy-target.js');
 const { BINDING, createRendererApiBridge, rendererBridgeSource } = require('./renderer-api-bridge.js');
 const { createCodeBuddyNative } = require('./codebuddy-native.js');
 const { createCodeBuddySessionStore } = require('./codebuddy-session-store.js');
-const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageTarget } = require('./cdp-targets.js');
+const { classifyTarget, looksLikeWbFamilyTarget, isTargetForProfile, selectPageTarget, selectIdeTargets } = require('./cdp-targets.js');
 const { createSessionDb, normalizeSessionIdBatch, parameterCount } = require('./session-db.js');
 const { createDirtyIndex } = require('./session-dirty.js');
 const {
@@ -432,8 +432,9 @@ const primaryAccountStore = createPrimaryAccountStore(DATA_DIR, (uid) => fs.exis
 // 1.2.188：关闭主题接管时跟随 WorkBuddy AI 的原生 agent-ui-theme，避免旧快照覆盖官方浅色/深色选择。
 // 1.2.189：毛玻璃底色等待移至 daemon，避免后台页面定时器节流拖延开关和壁纸加载。
 // 1.2.191：CodeDaddy 共用完整面板，通过本机 CDP 适配通信、原生登录态和会话缓存。
-const DAEMON_VERSION = '1.2.205';
-const DAEMON_BUILD_ID = 'release-1.2.205-20260929-codebuddy-cn-executable';
+// 1.2.10：合并会话、用量、启动器及 CodeBuddy IDE 注入重试与积分刷新修复。
+const DAEMON_VERSION = '1.2.10';
+const DAEMON_BUILD_ID = 'release-1.2.10-20260930-markdown-preview';
 const usageReporter = createUsageReporter({ profile: PROFILE.id, version: DAEMON_VERSION });
 configureAutomationRuntime({version: DAEMON_VERSION, profileId: PROFILE.id, platform: process.platform});
 const automationDiscovery = createAutomationDiscovery({
@@ -2305,6 +2306,165 @@ function onCdpEvent(method, params) {
   }
 }
 
+// ===== [CodeBuddy IDE 状态栏] IDE 主窗口轻量浮层管理器 =====
+// 主连接（connectCdp）保持 1.2.9 原行为：只绑定 agentManager.html（完整面板）。
+// IDE 主窗口（workbench.html）由本管理器并行维护：每个 IDE 窗口一条独立 ws，
+// 只注入轻量 FAB（inject.js 运行时通过 location.href 自判 IDE 分支）。
+// 主连接单 target 且不重选：若让 workbench 走主连接，先出现的 workbench 会被
+// 绑定，后打开的 agents 窗口将永远等不到注入（实测回归），故必须双路。
+const idePages = new Map(); // Per-target connection, navigation and injection retry state.
+const IDE_INJECT_MAX_ATTEMPTS = 3;
+const IDE_COMMAND_TIMEOUT_MS = 10000;
+
+function ideSend(entry, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (!entry.ws || entry.ws.readyState !== 1) return reject(new Error('IDE ws 未连接'));
+    const id = ++entry.msgId;
+    const timer = setTimeout(() => {
+      entry.pending.delete(id);
+      reject(new Error('IDE CDP request timed out'));
+    }, IDE_COMMAND_TIMEOUT_MS);
+    entry.pending.set(id, { resolve, reject, timer });
+    try {
+      entry.ws.send(JSON.stringify({ id, method, params }));
+    } catch (e) {
+      entry.pending.delete(id);
+      clearTimeout(timer);
+      reject(e);
+    }
+  });
+}
+
+function ideInjectPage(entry, reason) {
+  if (entry.injecting) return entry.injecting;
+  if (entry.closed || entry.mounted || entry.attempts >= IDE_INJECT_MAX_ATTEMPTS || Date.now() < entry.retryAt) return Promise.resolve();
+  const navigation = entry.navigation;
+  entry.attempts++;
+  entry.injecting = (async () => {
+    try {
+      const script = buildInjectScript();
+      // 与主连接注入管线一致：先注册 binding（rendererBridgeSource 的 __wbsApiFetch 依赖它）
+      await ideSend(entry, 'Runtime.addBinding', { name: BINDING });
+      if (entry.closed || entry.navigation !== navigation) return;
+      // 脚本顶部 cleanup IIFE 已移除 #wbs-ide-statusbar-root，这里不重复清理
+      const result = await ideSend(entry, 'Runtime.evaluate', { expression: script, returnByValue: false });
+      if (result && result.exceptionDetails) {
+        const ex = result.exceptionDetails.exception;
+        log(`[cdp-ide] IDE 浮层注入抛错(${reason}): ${redactDiagnosticText((ex && (ex.description || ex.value)) || result.exceptionDetails.text || '', 300)}`);
+        return;
+      }
+      // IDE 分支不挂 .wbs-root/__wbsWidget，只认 FAB 根节点
+      let mounted = false;
+      for (let attempt = 0; attempt < 3 && !mounted && !entry.closed && entry.navigation === navigation; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 200 : 600));
+        if (entry.closed || entry.navigation !== navigation) return;
+        const check = await ideSend(entry, 'Runtime.evaluate', {
+          expression: 'JSON.stringify({ fab: !!document.getElementById("wbs-ide-statusbar-root"), ready: document.readyState })',
+          returnByValue: true,
+        }).catch(() => null);
+        const state = check && check.result && check.result.value ? JSON.parse(check.result.value) : {};
+        mounted = !!state.fab;
+        if (attempt === 2) log(`[cdp-ide] IDE 浮层注入${mounted ? '确认' : '未确认'}(${reason}): ${JSON.stringify(state)}`);
+      }
+      if (entry.closed || entry.navigation !== navigation) return;
+      entry.mounted = mounted;
+      if (mounted) log(`[cdp-ide] IDE 浮层已注入(${reason}) target=${String(entry.url || '').slice(-64)}`);
+    } catch (e) {
+      log(`[cdp-ide] IDE 浮层注入失败(${reason}): ${e.message}`);
+    }
+  })().finally(() => {
+    entry.injecting = null;
+    if (!entry.closed && entry.navigation === navigation && !entry.mounted) {
+      entry.retryAt = Date.now() + 1000 * (2 ** (entry.attempts - 1));
+    }
+  });
+  return entry.injecting;
+}
+
+function ideConnectPage(target) {
+  const entry = { ws: null, url: target.url, msgId: 0, pending: new Map(), reloadTimer: null,
+    injecting: null, mounted: false, attempts: 0, retryAt: 0, navigation: 0, closed: false };
+  idePages.set(target.id, entry);
+  // [CodeBuddy IDE 状态栏] workbench 页面 CSP 禁止直接 fetch http://，api() 走
+  // __wbsApiFetch（Runtime.bindingCalled 通道）。主连接的 bridge 把 send 绑死在
+  // cdpSend 上，因此每个 IDE 页面必须建自己的 bridge 实例，回复才能回到同一页面。
+  entry.bridge = createRendererApiBridge({ token: API_TOKEN, port: () => ACTUAL_PORT, send: (method, params) => ideSend(entry, method, params) });
+  const ws = new WebSocketCtor(target.webSocketDebuggerUrl);
+  entry.ws = ws;
+  ws.onopen = () => {
+    ideSend(entry, 'Page.enable').catch(() => {}); // 监听 loadEventFired 以便刷新后补注入
+    ideInjectPage(entry, 'connect');
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
+    if (msg.id !== undefined) {
+      const p = entry.pending.get(msg.id);
+      if (p) {
+        entry.pending.delete(msg.id);
+        clearTimeout(p.timer);
+        msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
+      }
+      return;
+    }
+    // IDE 浮层 FAB 的账号列表/切换请求经 binding 通道进来，用本页 bridge 应答
+    if (msg.method === 'Runtime.bindingCalled') {
+      entry.bridge(msg.params || {}).catch(() => {});
+      return;
+    }
+    // workbench 刷新会重建 DOM，加载完成后补一次注入（脚本幂等）
+    if (msg.method === 'Page.loadEventFired') {
+      entry.navigation++;
+      entry.mounted = false;
+      entry.attempts = 0;
+      entry.retryAt = Date.now() + 400;
+      if (entry.reloadTimer) clearTimeout(entry.reloadTimer);
+      entry.reloadTimer = setTimeout(() => {
+        entry.reloadTimer = null;
+        if (entry.ws && entry.ws.readyState === 1) ideInjectPage(entry, 'reload');
+      }, 400);
+    }
+  };
+  ws.onclose = () => {
+    entry.closed = true;
+    for (const pending of entry.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('IDE CDP connection closed'));
+    }
+    entry.pending.clear();
+    if (entry.reloadTimer) clearTimeout(entry.reloadTimer);
+    if (idePages.get(target.id) === entry) idePages.delete(target.id);
+    log(`[cdp-ide] IDE 页面连接关闭 target=${String(target.url || '').slice(-64)}`);
+  };
+  ws.onerror = () => {};
+}
+
+async function ideSyncScan() {
+  if (PROFILE.kind !== 'codebuddy' || !WebSocketCtor) return;
+  let port = cdp.port;
+  if (!port) port = await findCdpEndpoint();
+  if (!port) return;
+  let list;
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) });
+    list = await r.json();
+  } catch (_) {
+    return; // 端口不可达，跳过本轮
+  }
+  const targets = selectIdeTargets(list, PROFILE);
+  for (const target of targets) {
+    if (!target.webSocketDebuggerUrl) continue;
+    const entry = idePages.get(target.id);
+    if (!entry) ideConnectPage(target);
+    else if (entry.ws && entry.ws.readyState === 1) ideInjectPage(entry, 'retry');
+  }
+  // 兜底清理：target 已消失但 ws 尚未触发 close 的陈旧条目
+  const alive = new Set(targets.map((t) => t.id));
+  for (const [id, entry] of idePages) {
+    if (!alive.has(id) && (!entry.ws || entry.ws.readyState !== 1)) idePages.delete(id);
+  }
+}
+
 async function cdpLoop() {
   for (;;) {
     if (!cdp.connected) {
@@ -2314,6 +2474,8 @@ async function cdpLoop() {
         log(`[cdp] 连接异常: ${e.message}`);
       }
     }
+    // [CodeBuddy IDE 状态栏] IDE 主窗口浮层独立于主连接扫描注入（详见 ideSyncScan）
+    ideSyncScan().catch((e) => log(`[cdp-ide] IDE 扫描异常: ${e.message}`));
     await new Promise((r) => setTimeout(r, CDP_RECONNECT_MS));
   }
 }
@@ -2349,9 +2511,21 @@ async function reloadWorkBuddyPage(options = {}) {
   const pending = armPendingReloadInjection(frameId);
   try {
     await withTimeout(cdpSend('Page.reload', { ignoreCache: false }), 10000, '刷新 WorkBuddy 页面');
-    if (options.waitForInjection === false) return true;
+    // WorkBuddy's SQLite replacement and renderer reload do not publish the
+    // local collection change. Refresh after WorkDaddy has mounted so the
+    // official controller sees migrated/history rows before user interaction.
+    const refreshAfterMount = pending.ready.then((mounted) => {
+      if (!mounted) return false;
+      const uid = String((currentAccount() || {}).uid || '').trim();
+      return refreshWorkBuddySessionList(uid, 'account-reload');
+    }).catch(() => false);
+    if (options.waitForInjection === false) {
+      refreshAfterMount.catch(() => {});
+      return true;
+    }
     const mounted = await pending.ready;
     if (!mounted) log('[cdp] 页面重载后组件未在 5 秒内确认挂载，继续后台流程');
+    if (mounted) await refreshAfterMount;
     return mounted;
   } catch (error) {
     settlePendingReloadInjection(pending, false);
@@ -3905,6 +4079,7 @@ async function injectWidget(reason, executionContextId) {
 }
 
 function buildInjectScript() {
+  const markdownScript = fs.readFileSync(path.join(__dirname, 'markdown-preview.js'), 'utf8');
   const toastScript = fs.readFileSync(path.join(__dirname, 'toast-runtime.js'), 'utf8');
   const compatScript = fs.readFileSync(path.join(__dirname, 'workbuddy-compat.js'), 'utf8');
   let injectScript = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
@@ -3948,7 +4123,8 @@ function buildInjectScript() {
   })();\n` : '';
   let source = (PROFILE.kind === 'codebuddy' ? rendererBridgeSource() : '') + toastScript + '\n' + compatScript + '\n' + injectScript;
   if (PROFILE.kind === 'codebuddy') source = source.replace(/\.innerHTML\b/g, '.__wbsHTML').replace(/\binnerHTML\s*:/g, '__wbsHTML:').replace(/\.outerHTML\b/g, '.__wbsOuterHTML').replace(/\.insertAdjacentHTML\b/g, '.__wbsInsertAdjacentHTML');
-  return (trustedTypesBootstrap + source)
+  // Keep the sanitizer outside the legacy innerHTML sink rewrite.
+  return (trustedTypesBootstrap + markdownScript + '\n' + source)
     .replace(/__WBS_API__/g, `http://${HOST}:${ACTUAL_PORT}`)
     .replace(/__WBS_VERSION__/g, DAEMON_VERSION)
     // 注入本地 API 能力凭证；旧版面板不会携带该 header，但新版 daemon 会在启动时重新注入新版面板。
@@ -4634,6 +4810,110 @@ function sessionCopyContentRevision(row) {
   ]);
 }
 
+// WorkBuddy stores the context-window denominator on the session row and the
+// usage ring data in session_usage. Both are optional across client versions;
+// a missing column/table must not break account switching for older clients.
+let sessionContextWindowState = typeof PROFILE !== 'undefined' && PROFILE.kind === 'workbuddy' ? 'unknown' : 'unsupported';
+let sessionUsageState = typeof PROFILE !== 'undefined' && PROFILE.kind === 'workbuddy' ? 'unknown' : 'unsupported';
+
+function isMissingSessionStorageError(error) {
+  return /no such (table|column)/i.test(String(error && error.message || error || ''));
+}
+
+async function readSessionContextWindow(id) {
+  if (sessionContextWindowState === 'unsupported') return null;
+  try {
+    const rows = await sqliteQuery('SELECT context_window FROM sessions WHERE id = ? LIMIT 1;', [id]);
+    sessionContextWindowState = 'supported';
+    const value = rows && rows[0] && rows[0].context_window;
+    if (value === '' || value === null || value === undefined) return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionContextWindowState = 'unsupported';
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function writeSessionContextWindow(id, value) {
+  if (sessionContextWindowState === 'unsupported' || value === null || value === undefined) return;
+  try {
+    await sqliteRun(
+      'UPDATE sessions SET context_window = ? WHERE id = ? AND deleted_at IS NULL;',
+      [value, id]
+    );
+    sessionContextWindowState = 'supported';
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionContextWindowState = 'unsupported';
+      return;
+    }
+    throw error;
+  }
+}
+
+async function copySessionUsage(sourceId, targetId) {
+  if (sessionUsageState === 'unsupported') return;
+  let sourceRows;
+  try {
+    sourceRows = await sqliteQuery(
+      'SELECT used, size, updated_at, credit_json FROM session_usage WHERE session_id = ? LIMIT 1;',
+      [sourceId]
+    );
+    sessionUsageState = 'supported';
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionUsageState = 'unsupported';
+      return;
+    }
+    throw error;
+  }
+  if (!sourceRows || !sourceRows.length) return;
+  const source = sourceRows[0];
+  const used = source.used === '' ? null : Number(source.used);
+  const size = source.size === '' ? null : Number(source.size);
+  if (![used, size].every(value => value === null || Number.isFinite(value))) return;
+  let targetRows;
+  try {
+    targetRows = await sqliteQuery(
+      'SELECT used, size, updated_at, credit_json FROM session_usage WHERE session_id = ? LIMIT 1;',
+      [targetId]
+    );
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionUsageState = 'unsupported';
+      return;
+    }
+    throw error;
+  }
+  const target = targetRows && targetRows[0];
+  if (target && String(target.used || '') === String(source.used || '') &&
+      String(target.size || '') === String(source.size || '') &&
+      String(target.updated_at || '') === String(source.updated_at || '') &&
+      String(target.credit_json || '') === String(source.credit_json || '')) return;
+  try {
+    await sqliteRun(
+      'INSERT OR REPLACE INTO session_usage (session_id, used, size, updated_at, credit_json) VALUES (?, ?, ?, ?, ?);',
+      [
+        targetId,
+        used,
+        size,
+        source.updated_at === '' ? null : Number(source.updated_at),
+        source.credit_json === '' ? null : String(source.credit_json),
+      ]
+    );
+  } catch (error) {
+    if (isMissingSessionStorageError(error)) {
+      sessionUsageState = 'unsupported';
+      return;
+    }
+    throw error;
+  }
+}
+
 // This revision is the cheap fallback used when the renderer event was
 // missed. WorkBuddy advances updated_at for edits that do not necessarily
 // change the sidebar lifecycle payload, so it is part of the observable
@@ -4818,6 +5098,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
     ))[0];
     const sourceRow = await readRow(src.id, sourceUid);
     if (!sourceRow) throw new Error('源会话已变化，请重试');
+    const sourceContextWindow = await readSessionContextWindow(sourceRow.id);
     const dirtyIndex = typeof getSessionDirtyIndex === 'function' ? getSessionDirtyIndex() : null;
     const dirtyMarker = options.auto && dirtyIndex ? dirtyIndex.get(sourceUid, sourceRow.id) : null;
     const clearAutoDirty = () => {
@@ -4866,7 +5147,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
     // Fast path is opt-in by fingerprintVersion so mappings written before
     // revision persistence are revalidated once through the normal snapshot
     // comparison path.
-    if (options.auto && existingMappingTarget && mapping.fingerprintVersion === 2 &&
+    if (options.auto && existingMappingTarget && mapping.fingerprintVersion === 3 &&
         mappingSourceRevisionMatches(mapping, sourceUid, sourceRow) &&
         mappingTargetRevisionMatches(mapping, existingMappingTarget)) {
       const sourceBytes = Number(mapping.sourceBytes);
@@ -4882,10 +5163,31 @@ async function copySessionRecord(src, targetUid, options = {}) {
         copiedBytes: 0,
       };
     }
-    let left = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, sourceRow.id, aliases, syncCache);
+    // Version 3 proves transcript runtime IDs were rebound, not merely that
+    // two accounts have equal messages. Revalidate legacy mappings once.
+    let runtimeRepairBytes = 0;
+    const readAndRepairSnapshot = async id => {
+      let snapshot = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, id, aliases, syncCache);
+      if (PROFILE.kind !== 'workbuddy') return snapshot;
+      const row = id === sourceRow.id ? sourceRow : candidates.find(candidate => candidate.id === id);
+      const guard = async () => {
+        await assertSessionSyncIdle([id]);
+        if (row && JSON.stringify(await readRow(id, row.user_id)) !== JSON.stringify(row)) {
+          throw new Error('会话记录正在变化，请稍后重试');
+        }
+      };
+      const repaired = await sessionSync.repairRuntimeIdentity(snapshot, {
+        backupRoot: path.join(DATA_DIR, 'session-sync-backups'), guard,
+        commit: async verify => { await guard(); await verify(); },
+      });
+      runtimeRepairBytes += repaired.copiedBytes;
+      if (repaired.copied) snapshot = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, id, aliases, syncCache);
+      return snapshot;
+    };
+    let left = await readAndRepairSnapshot(sourceRow.id);
     const selection = await sessionSync.selectTargetSnapshot(left, targetIds, async id => {
       await yieldAutoCopyToRenderer();
-      return sessionSync.readSnapshotAsync(PROFILE.dataRoot, id, aliases, syncCache);
+      return readAndRepairSnapshot(id);
     }, mapping && mapping.targetId);
     // A divergent source still needs to reach the destination. Publish it as
     // a new physical session in the same lineage, so later scans find it by
@@ -4904,7 +5206,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
       await withAutoCopyMetaWrite(() => {
         if (!getAutoCopySessionMembers(DATA_DIR, lineageId, targetUid).includes(targetId)) addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, targetId);
         setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
-          targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 2,
+          targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 3,
           ...mappingWithSourceRevision(mapping, sourceUid, sourceRow),
           targetRevision: sessionCopyRowRevision(existing || { ...sourceRow, id: targetId, user_id: targetUid }),
           targetStateRevision: sessionCopyStableStateRevision(existing || { ...sourceRow, id: targetId, user_id: targetUid }),
@@ -4913,7 +5215,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
       });
       const warning = left.totalBytes > 100 * 1024 * 1024 ? '会话超过 100 MB，同步可能较慢' : '';
       clearAutoDirty();
-      return { status: 'skipped', sourceId: src.id, targetId, branched: false, failedFiles: 0, warning, sourceBytes: left.totalBytes, totalBytes: left.totalBytes, copiedBytes: 0 };
+      return { status: runtimeRepairBytes ? 'copied' : 'skipped', sourceId: src.id, targetId, branched: false, failedFiles: 0, warning, sourceBytes: left.totalBytes, totalBytes: left.totalBytes, copiedBytes: runtimeRepairBytes };
     }
     let right = await sessionSync.readSnapshotAsync(PROFILE.dataRoot, targetId, aliases, syncCache);
     // Size is advisory only; both manual and automatic sync keep all files.
@@ -4926,9 +5228,9 @@ async function copySessionRecord(src, targetUid, options = {}) {
     }
     const comparison = sessionSync.compareSnapshots(left, right);
     if (comparison.kind === 'conflict') throw new Error('会话记录正在变化，请稍后重试');
-    let changed = false;
+    let changed = runtimeRepairBytes > 0;
     let totalBytes = left.totalBytes;
-    let copiedBytes = 0;
+    let copiedBytes = runtimeRepairBytes;
     let persistedTargetRow = existing || null;
     const update = async (from, to, fromRow, toRow, missingOnly = false) => {
       await yieldAutoCopyToRenderer();
@@ -4948,6 +5250,8 @@ async function copySessionRecord(src, targetUid, options = {}) {
           // after insertion cannot create an untracked duplicate on retry.
           await withAutoCopyMetaWrite(() => addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, targetId, { branchCopy: branched }));
           persistedTargetRow = await insertCopiedSession(fromRow, targetUid, targetId);
+          await writeSessionContextWindow(targetId, sourceContextWindow);
+          await copySessionUsage(fromRow.id, targetId);
         }
         else if (!missingOnly) {
           const updatedAt = Number(fromRow.updated_at || 0);
@@ -4957,6 +5261,8 @@ async function copySessionRecord(src, targetUid, options = {}) {
             [fromRow.title || '', fromRow.custom_title || '', fromRow.status || 'Pending',
               updatedAt, lastActivityAt, toRow.id, toRow.user_id]
           );
+          await writeSessionContextWindow(toRow.id, sourceContextWindow);
+          await copySessionUsage(fromRow.id, toRow.id);
           persistedTargetRow = Object.assign({}, toRow, {
             title: fromRow.title || '', custom_title: fromRow.custom_title || '', status: fromRow.status || 'Pending',
             updated_at: updatedAt, last_activity_at: lastActivityAt,
@@ -4988,7 +5294,7 @@ async function copySessionRecord(src, targetUid, options = {}) {
     await withAutoCopyMetaWrite(() => {
       if (!getAutoCopySessionMembers(DATA_DIR, lineageId, targetUid).includes(targetId)) addAutoCopySessionMember(DATA_DIR, lineageId, targetUid, targetId);
       return setAutoCopyMapping(DATA_DIR, lineageId, targetUid, {
-        targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 2,
+        targetId, status: 'copied', failedFiles: 0, fingerprintVersion: 3,
         ...mappingWithSourceRevision(mapping, sourceUid, sourceRow),
         targetRevision: sessionCopyRowRevision(mappingTarget),
         targetStateRevision: sessionCopyStableStateRevision(mappingTarget),
@@ -5042,7 +5348,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
     ? getSessionDirtyIndex()
     : { shouldSync: () => true };
   const clearStableDirtyMarker = (row, mapping, provenEqual = false) => {
-    if (!mapping || mapping.fingerprintVersion !== 2 || !mapping.targetId ||
+    if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId ||
         (!provenEqual && !mappingSourceRevisionMatches(mapping, source, row))) return false;
     if (typeof dirtyIndex.get !== 'function' || typeof clearSessionDirty !== 'function') return false;
     const marker = dirtyIndex.get(source, row.id);
@@ -5111,7 +5417,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
       if (!initializedClean(row)) return false;
       const lineageId = rules.allLineages && rules.allLineages[String(row.id)];
       const mapping = lineageId ? mappings.get(String(lineageId)) : null;
-      return mapping && mapping.fingerprintVersion === 2 && mapping.targetId &&
+      return mapping && mapping.fingerprintVersion === 3 && mapping.targetId &&
         !mappingSourceRevisionMatches(mapping, source, row);
     });
     if (hasRevisionDrift) await loadTargetRows();
@@ -5143,7 +5449,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
       // The target mapping is enough to restore the active view. Only enter
       // the worker when it is missing, its row disappeared, or the renderer
       // explicitly marked the source session dirty.
-      if (!mapping || mapping.fingerprintVersion !== 2 || !mapping.targetId ||
+      if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId ||
           !targetById || !targetById.has(String(mapping.targetId))) {
         dirtyRows.push(row);
         continue;
@@ -5171,6 +5477,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
     }
     const lineageId = rules.allLineages && rules.allLineages[String(row.id)];
     const mapping = lineageId ? mappings.get(String(lineageId)) : null;
+    if (mapping && mapping.fingerprintVersion !== 3) { dirtyRows.push(row); continue; }
     if (dirtyIndex.shouldSync(source, row.id)) {
       if (clearStableDirtyMarker(row, mapping)) continue;
       if (mappingSourceLifecycleRevisionMatches(mapping, row) && targetById && stableTargetExists(mapping)) {
@@ -5180,7 +5487,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
       dirtyRows.push(row);
       continue;
     }
-    if (!mapping || mapping.fingerprintVersion !== 2 || !mapping.targetId) { dirtyRows.push(row); continue; }
+    if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId) { dirtyRows.push(row); continue; }
     if (mappingSourceRevisionMatches(mapping, source, row)) continue;
     // Once the renderer has supplied a baseline, a persisted revision drift
     // without a dirty event is historical lineage churn, not a content edit.
@@ -5217,7 +5524,7 @@ async function buildAutoCopyPlan(sourceUid, targetUid, requestedSessionIds = [])
   // unchanged sessions do not need to enter the worker pool at all.
   return lineageRows.filter((row) => {
     const mapping = row.lineageId ? mappings.get(String(row.lineageId)) : null;
-    if (!mapping || mapping.fingerprintVersion !== 2 || !mapping.targetId) return true;
+    if (!mapping || mapping.fingerprintVersion !== 3 || !mapping.targetId) return true;
     const targetRow = targetById.get(String(mapping.targetId));
     return !targetRow || !mappingSourceRevisionMatches(mapping, source, row) ||
       (!mappingTargetRevisionMatches(mapping, targetRow) &&
@@ -5515,14 +5822,15 @@ function startAutoCopyJob(sourceUid, targetUid, plan, labels) {
   return job;
 }
 
-async function refreshCopiedSessionList(job) {
-  // WorkBuddy copies commit SQLite directly, bypassing its list-change bus.
-  // Its first post-switch snapshot can therefore predate this batch. Use the
-  // official collection refresh (including grouped folders), never navigation
-  // or a second renderer reload. CodeBuddy already publishes native upserts;
-  // it has a different store and must not enter this SDK path.
-  if (PROFILE.kind !== 'workbuddy' || !(job.copied || job.partial || job.conflicts)) return;
-  if (!cdp.connected || String((currentAccount() || {}).uid || '') !== String(job.targetUid)) return;
+async function refreshWorkBuddySessionList(targetUid, reason = 'sessions') {
+  // WorkBuddy writes session SQLite directly, bypassing its list-change bus.
+  // Its first snapshot can therefore predate a migration, account switch, or
+  // copy batch. Use the official collection refresh (including grouped
+  // folders), never navigation or a second renderer reload. CodeBuddy already
+  // publishes native upserts; it has a different store and must not enter this
+  // SDK path.
+  if (PROFILE.kind !== 'workbuddy') return false;
+  if (!cdp.connected || String((currentAccount() || {}).uid || '') !== String(targetUid || '')) return false;
   let timer;
   try {
     const response = await Promise.race([
@@ -5541,13 +5849,21 @@ async function refreshCopiedSessionList(job) {
       // delay restoring the selected conversation indefinitely.
       new Promise(resolve => { timer = setTimeout(() => resolve(null), 2000); }),
     ]);
-    log('[sessions-auto-copy] 列表刷新' + (response && response.result && response.result.value === true ? '已完成' : '未确认；复制结果已保留'));
+    const confirmed = response && response.result && response.result.value === true;
+    log('[' + reason + '] 列表刷新' + (confirmed ? '已完成' : '未确认；已保留本地会话数据'));
+    return confirmed;
   } catch (_) {
     // A disconnected renderer cannot invalidate already committed files/rows.
-    log('[sessions-auto-copy] 列表刷新暂不可用；复制结果已保留');
+    log('[' + reason + '] 列表刷新暂不可用；已保留本地会话数据');
+    return false;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function refreshCopiedSessionList(job) {
+  if (!job || !(job.copied || job.partial || job.conflicts || job.openSessionId)) return false;
+  return refreshWorkBuddySessionList(job.targetUid, 'sessions-auto-copy');
 }
 
 function publicAutoCopyJob(job) {
@@ -10461,7 +10777,7 @@ function handleApi(req, res) {
       try {
         const rows = await sqliteQuery(
           'SELECT ' + SESSION_COPY_COLUMNS.join(',') +
-            ' FROM sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1;',
+            " FROM sessions WHERE id = ? AND (user_id = ? OR user_id = '') AND deleted_at IS NULL LIMIT 1;",
           [id, uid]
         );
         if (!rows.length) return json(res, 404, { ok: false, error: '当前账号下没有该会话' });
@@ -10535,6 +10851,10 @@ function handleApi(req, res) {
             log(`[sessions-auto-copy] 迁移规则 ${row.id} 失败: ${e.message}`);
           }
         }
+        // The migration changes ownership in SQLite without going through
+        // WorkBuddy's collection store. Refresh the visible account's list so
+        // a migrated history row is hydrated by the official controller.
+        await refreshWorkBuddySessionList(String((currentAccount() || {}).uid || '').trim(), 'sessions-migrate');
         return json(res, 200, { ok: true, moved: before.length, requested: ids.length, targetUid, rulesMoved });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
