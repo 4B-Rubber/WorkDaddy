@@ -1932,6 +1932,11 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '不是 WorkDaddy 的账号导出文件': 'Not a WorkDaddy account export file', '导入文件中没有账号数据': 'No account data found in the import file',
     '未读取到有效内容，请选择导出文件': 'No valid content read; please choose an export file', '密码不能超过 1024 个字符': 'Password cannot exceed 1024 characters',
     '当前登录文件无法唯一确认，已拒绝退出登录': 'The current login file cannot be uniquely identified; logout rejected',
+    '原生登录态已切换，无需重启客户端': 'Native login session switched; no restart needed',
+    '登录文件已切换，请刷新窗口使新账号生效': 'Login file switched; refresh the window to apply the new account',
+    '已切换并触发窗口刷新': 'Switched and the window refresh was triggered',
+    '跨工作区会话请在对应项目窗口的历史中查看': 'Cross-workspace sessions appear in the history of that project window',
+    '同步到其他账号': 'Sync to another account',
     '不能删除当前登录的账号（请先退出登录或切换到其他账号）': 'Cannot delete the currently logged-in account (log out or switch to another account first)',
     '删除登录文件后仍然存在': 'The login file still exists after deletion',
     '诊断设置由 WORKDADDY_TELEMETRY 环境变量控制': 'Diagnostics are controlled by the WORKDADDY_TELEMETRY environment variable',
@@ -9107,6 +9112,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
         return;
       }
       function canEditAutoCopy(uid) { return sessionsState.uid !== '' && !!uid; }
+      // [会话单条同步] 行内即时同步按钮：无需进批量模式，点击直接打开目标账号弹窗。
+      // SVG 内联保持自包含（测试 VM 按 renderSessions 源码切片执行，闭包外变量不可见）。
+      function sessSyncButton(s) {
+        return '<button class="wbs-sess-sync" type="button" data-id="' + escAttr(s.id) + '" title="同步到其他账号" aria-label="同步到其他账号">' +
+          '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M20 7H8"/><path d="M8 21l-4-4 4-4"/><path d="M4 17h12"/></svg></button>';
+      }
       function autoCopyButton(kind, key, uid, enabled, inherited) {
         if (sessionsState.autoCopyAll || !canEditAutoCopy(uid)) return '';
         var title = inherited ? '随空间自动同步' : (enabled ? '取消自动同步' : '切换账号时自动同步');
@@ -9147,7 +9158,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + escAttr(s.id) + '"' + sel + '>' : '') +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
             '<span class="wbs-sess-meta">' + esc(fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at)) + '</span></span>' +
-            (batch ? '' : autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
+            (batch ? '' : sessSyncButton(s) + autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
             '<span class="wbs-sess-size" title="会话大小（消息和附件）">' + sessionCopySizeText(s.totalBytes) + '</span>' +
             '</div>';
         });
@@ -9180,7 +9191,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             (batch ? '<input type="checkbox" class="wbs-sess-check" data-id="' + escAttr(s.id) + '"' + sel + '>' : '') +
             '<span class="wbs-sess-main"><span class="wbs-sess-title">' + esc(title) + '</span>' +
             '<span class="wbs-sess-meta">' + esc(fmtHumanTime(s.last_activity_at || s.updated_at || s.created_at)) + '</span></span>' +
-            (batch ? '' : autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
+            (batch ? '' : sessSyncButton(s) + autoCopyButton('session', s.id, s.user_id, marked, inherited)) +
             '<span class="wbs-sess-size" title="会话大小（消息和附件）">' + sessionCopySizeText(s.totalBytes) + '</span>' +
             '</div>';
         });
@@ -9244,6 +9255,14 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function bindSessEvents(listEl) {
       listEl.onclick = function (e) {
         var t = e.target;
+        // [会话单条同步] 行内同步按钮：打开单条目标账号弹窗
+        var syncBtn = t.closest ? t.closest('.wbs-sess-sync') : null;
+        if (syncBtn) {
+          e.preventDefault();
+          e.stopPropagation();
+          openCopyModal([syncBtn.getAttribute('data-id')]);
+          return;
+        }
         var autoBtn = t.closest ? t.closest('.wbs-sess-auto') : null;
         if (autoBtn) {
           e.preventDefault();
@@ -9694,7 +9713,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ ids: ids, targetUid: sel.value }),
           }).then(function (result) {
-            toast(sessionCopySummaryText(result), false, root);
+            // [CodeBuddy 会话同步] 主窗口历史记录按工作区隔离：cwd 与当前窗口工作区不同的
+            // 会话不会出现在本窗口历史里（CodeBuddy 设计，非同步失败）。同工作区会话已由
+            // daemon 的 reloadIdeWorkbenchWindows 让侧边栏立即可见；跨工作区只作提示。
+            var currentWorkspaceName = '';
+            var titleMatch = /^([^–]+?)\s+-\s+CodeBuddy/.exec(String(document.title || ''));
+            if (titleMatch) currentWorkspaceName = titleMatch[1].trim();
+            var crossWorkspace = currentWorkspaceName && sessionsState.list.some(function (s) {
+              if (ids.indexOf(s.id) === -1 || !s.cwd) return false;
+              var folder = String(s.cwd).replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+              return folder !== currentWorkspaceName;
+            });
+            toast(sessionCopySummaryText(result) +
+              (crossWorkspace && (Number(result && result.copied) || 0) > 0
+                ? ' · 跨工作区会话请在对应项目窗口的历史中查看' : ''), false, root);
             showSessModal(false);
             loadSessions();
           }).catch(function (e) {
@@ -16052,10 +16084,12 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           })
             .then(function (r) {
               var autoCopy = r && r.autoCopy;
+              // 兜底文案优先用 daemon 返回的 hint：codebuddy 走原生会话替换，切换即时生效
+              // （无需重启/刷新），"重启后生效"只适用于 WorkBuddy 文件替换且 CDP 刷新失败的场景。
               toast(
                 r.reloaded
                   ? (autoCopy && autoCopy.jobId ? '已切换为「' + (r.nickname || r.uid) + '」，正在同步已标记会话…' : '已切换为「' + (r.nickname || r.uid) + '」，开始领取积分…')
-                  : '已切换为「' + (r.nickname || r.uid) + '」，重启后生效',
+                  : (r.hint || '已切换为「' + (r.nickname || r.uid) + '」，重启后生效'),
                 false,
                 root
               );
@@ -17545,6 +17579,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-sess-auto.inherited{color:var(--wb-button-primary-bg,#1f1f1f);opacity:.62;cursor:default}',
     '.wbs-sess-auto:disabled{cursor:default}',
     '.wbs-sess-auto-label{font-size:11px;line-height:1;white-space:nowrap}',
+    /* [会话单条同步] 行内同步图标按钮：尺寸/圆角/交互色与自动同步按钮一致 */
+    '.wbs-sess-sync{display:inline-flex;align-items:center;justify-content:center;flex:0 0 auto;width:26px;height:26px;margin-top:-2px;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--wb-icon-tertiary,#999);cursor:pointer;padding:0;transition:background .15s,color .15s;font:inherit}',
+    '.wbs-sess-sync:hover{background:var(--wb-bg-hover,#f5f5f5);color:var(--wb-color-text-primary,#1f1f1f)}',
+    '.wbs-sess-sync:focus-visible{outline:2px solid color-mix(in srgb,var(--wb-color-text-primary,#1f1f1f) 50%,transparent);outline-offset:1px}',
     '.wbs-sess-auto-switch{position:relative;display:inline-flex;align-items:center;width:24px;height:14px;flex:0 0 24px;border-radius:999px;background:var(--wb-bg-tertiary,#dedede);transition:background .15s}',
     '.wbs-sess-auto-switch span{width:10px;height:10px;margin-left:2px;border-radius:50%;background:var(--wb-bg-popover,#fff);box-shadow:0 1px 2px rgba(0,0,0,.18);transition:transform .15s}',
     '.wbs-sess-auto-switch.on{background:var(--wb-button-primary-bg,#1f1f1f)}',
@@ -17889,6 +17927,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-body:has(>[data-pane="account"].active){max-height:none;overflow:hidden}',
   ].join('');
   (document.head || document.documentElement).appendChild(css);
+
+  // [CodeBuddy IDE 状态栏] CodeBuddy 官方帐户菜单的账号行按"认证会话"累积渲染：genie 扩展
+  // 替换会话时只发 added 不发 removed（官方 logout 才清理），而菜单把每行都显示成当前
+  // 账号昵称 → WorkDaddy 原生切换后残留的旧账号条目看起来就是多个一模一样的"当前账号"头像行。
+  // 缓解：隐藏第一个之外的所有账号行（被隐藏行点击行为本就为空，无功能损失）。
+  // ⚠️ 1.2.10 起 IDE workbench 与 Agents 共用完整面板，本样式必须挂在完整面板注入路径
+  // （旧版放在不再调用的 injectCodeBuddyIdeMode 里导致 1.2.10 曾回归出"多个头像"）。
+  // 脚本顶部的 cleanup IIFE 已负责移除旧 #wbs-ide-menu-dedupe-style，此处重复注入幂等。
+  // ⚠️ 若官方将来支持真正的多账号展示（各行显示各自昵称），删除本规则即可。
+  if ((PROFILE_ID === 'codebuddy-cn' || PROFILE_ID === 'codebuddy-intl')
+      && /\/workbench\.html(?:[?#]|$)/i.test(location.href)) {
+    var ideMenuDedupe = document.createElement('style');
+    ideMenuDedupe.id = 'wbs-ide-menu-dedupe-style';
+    ideMenuDedupe.textContent = 'li.genie-account-menu-item ~ li.genie-account-menu-item{display:none !important;}';
+    (document.head || document.documentElement).appendChild(ideMenuDedupe);
+  }
   start();
 
   window.__wbsWidget = {
