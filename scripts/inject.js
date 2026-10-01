@@ -17889,6 +17889,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     '.wbs-body:has(>[data-pane="account"].active){max-height:none;overflow:hidden}',
   ].join('');
   (document.head || document.documentElement).appendChild(css);
+
+  // [CodeBuddy IDE 状态栏] CodeBuddy 官方帐户菜单的账号行按"认证会话"累积渲染：genie 扩展
+  // 替换会话时只发 added 不发 removed（官方 logout 才清理），而菜单把每行都显示成当前
+  // 账号昵称 → WorkDaddy 原生切换后残留的旧账号条目看起来就是多个一模一样的"当前账号"头像行。
+  // 缓解：隐藏第一个之外的所有账号行（被隐藏行点击行为本就为空，无功能损失）。
+  // ⚠️ 1.2.10 起 IDE workbench 与 Agents 共用完整面板，本样式必须挂在完整面板注入路径
+  // （旧版放在不再调用的 injectCodeBuddyIdeMode 里导致 1.2.10 曾回归出"多个头像"）。
+  // 脚本顶部的 cleanup IIFE 已负责移除旧 #wbs-ide-menu-dedupe-style，此处重复注入幂等。
+  // ⚠️ 若官方将来支持真正的多账号展示（各行显示各自昵称），删除本规则即可。
+  if ((PROFILE_ID === 'codebuddy-cn' || PROFILE_ID === 'codebuddy-intl')
+      && /\/workbench\.html(?:[?#]|$)/i.test(location.href)) {
+    var ideMenuDedupe = document.createElement('style');
+    ideMenuDedupe.id = 'wbs-ide-menu-dedupe-style';
+    ideMenuDedupe.textContent = 'li.genie-account-menu-item ~ li.genie-account-menu-item{display:none !important;}';
+    (document.head || document.documentElement).appendChild(ideMenuDedupe);
+  }
   start();
 
   window.__wbsWidget = {

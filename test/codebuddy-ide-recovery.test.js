@@ -69,3 +69,9 @@ test('IDE commands time out and pending commands reject on socket close', async 
   h.sockets[0].close(); await tick();
   assert.equal(h.context.done, true); assert.equal(h.context.saved.pending.size, 0);
 });
+
+test('IDE mount probe accepts the full panel root (.wbs-root), not only the legacy FAB', () => {
+  // 1.2.10 起 workbench 与 Agents 共用完整面板：探针若只认旧轻量浮层根
+  // （wbs-ide-statusbar-root）将永远"未确认"，日志误报且白白放弃重试预算。
+  assert.match(manager, /document\.querySelector\("\.wbs-root"\)/);
+});
