@@ -9882,11 +9882,19 @@ function handleApi(req, res) {
     if (url.searchParams.get('cacheStatus') === '1') return json(res, 200, { ok: true, cacheReady: tokenStatsCacheReady(PROFILE.dataRoot, codeBuddyFiles ? {cacheFile:path.join(DATA_DIR,'token-stats-cache.json')} : {}) });
     const days = Math.max(1, Math.min(90, Number(url.searchParams.get('days') || 7)));
     const accounts = listAccounts(DATA_DIR);
-    return sqliteQuery('SELECT id, user_id FROM sessions WHERE deleted_at IS NULL;')
-      .then((rows) => {
-        const sessionAccounts = Object.fromEntries(rows.map((row) => [String(row.id || ''), String(row.user_id || '')]).filter((item) => item[0] && item[1]));
+    // CodeDaddy history trees name their own owner, so its usage no longer
+    // depends on the live session registry: conversations deleted in the client
+    // keep their files, and history without a session record must not blank out
+    // a day. Other clients keep resolving owners through the sessions table.
+    const historyOptions = codeBuddyFiles ? codeBuddyFiles.tokenOptions({ refresh: url.searchParams.get('refresh') === '1' }) : null;
+    const owners = historyOptions ? Promise.resolve(historyOptions.sessionAccounts)
+      : sqliteQuery('SELECT id, user_id FROM sessions WHERE deleted_at IS NULL;')
+        .then((rows) => Object.fromEntries(rows.map((row) => [String(row.id || ''), String(row.user_id || '')]).filter((item) => item[0] && item[1])));
+    return owners
+      .then((sessionAccounts) => {
         const stats = scanTokenStatsCached(PROFILE.dataRoot, {
-          ...(codeBuddyFiles ? {...codeBuddyFiles.tokenOptions(rows.map(row=>row.id)),cacheFile:path.join(DATA_DIR,'token-stats-cache.json')} : {}),
+          ...(historyOptions || {}),
+          ...(codeBuddyFiles ? {cacheFile:path.join(DATA_DIR,'token-stats-cache.json')} : {}),
           days,
           account: url.searchParams.get('account') || '',
           model: url.searchParams.get('model') || '',
